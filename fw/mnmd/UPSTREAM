@@ -1,0 +1,17 @@
+MNMD voices: https://github.com/mmockett/OP-XY-MNMD at
+b717ea4cfbce3e372c3bd661b14d7c3aa9408aff (MIT, LICENSE):
+  include/md_dsp.hpp md_efm.hpp md_tables.hpp md_kit.hpp   <- lib/
+  voices/gnd_sn.hpp gnd_ns.hpp gnd_im.hpp                   <- voices/
+  voices/swave.hpp sid_6581.hpp fmp.hpp vo_6.hpp            <- voices/
+  voices/gnd_sin.hpp gnd_nois.hpp                           <- voices/
+Its SDK headers: https://github.com/etcetc000/open-xy at
+b7a9d2851efb62960da14cd12b5e22433493d367 (MIT, LICENSE.open-xy):
+  include/opxy/types.hpp audio.hpp q31.hpp                  <- sdk/include/opxy/
+
+Unmodified except q31.hpp: __arm__ paths for multiply (64-bit product >> 31,
+the portable path's floor without its division) and add (qadd). Same results
+as upstream's portable path (emu/voicecost.py checks against it).
+
+src/ is ours: voice.hpp wraps a module as an mdkit_voice (drums) or a
+pitched_voice (synths), gnd.cpp lists the GND machines, mm.cpp the
+Monomachine ones, common.cpp holds what all modules share.

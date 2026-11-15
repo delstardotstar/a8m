@@ -1,0 +1,128 @@
+Tallent Edition (Assimil8or extended firmware): EQ, filter, mix
+effects (compressors, reverb, delay), grain and Time Lock DSP.
+https://github.com/brandon-tallent/assimil8or-extended-firmware at
+5e9ff37004556783c82f6068b596f6684d22b324 (Release 1.2.2; MIT, LICENSE, NOTICE.md):
+  eq_math.c eq_design.h eq_model.c                 <- src/
+  (src/eq.S and src/filter.S ported to fx_run.c)
+  filter_curve.c mix_fx.c mix_fx.h mix_tables.h    <- ext/
+  grains.c (its engine, up to render())            <- ext/grains.c
+  timelock.c timelock.h joins.c hits.c             <- ext/ (Time Lock)
+Its glue (the patches into Rossum's app, panel pages, preset_extras.c) is
+not used; fw/src/fx.c, yml.c and ui.c are ours.
+
+Local changes:
+- eq.h: upstream's src/eq.h trimmed to the EQ and filter (no stock
+  addresses, extras, grain, Time Lock, MIDI, panel); struct eq_value and
+  struct filter_value moved to fw/src/preset.h (same layout); our hooks
+  (ta_master, ta_eq_base, ta_filter_base, ta_cv_counts, ta_ticks, ta_fx_run)
+  declared at the end.
+- patch.h: ours, the types and MEMORY_BARRIER eq.h's users need.
+- fx_run.c (was eq.S and filter.S): the same arithmetic as NEON
+  intrinsics, run a block at a time instead of stock's per-frame hook:
+  each four-lane group runs the filter, then the EQ section by section;
+  the filter in two passes (section 1, then section 2 and the output);
+  settled coefficients and wet levels skip their per-frame glide; a
+  published bank is taken at a block's first frame. Bit-identical to the
+  asm frame by frame (PROFILE_HASH). ta_fx_run(x[frames][8], frames) is
+  the entry (upstream: patch_channel_eq, with the output fade and effects
+  hook); the cutoff CV reads ta_cv_counts instead of stock's calibrated CV
+  block; no bank yet skips the EQ.
+- eq_model.c: master channel, playing zone's record, CV counts and the
+  millisecond clock through the hooks above; eq_automate (MIDI) and the
+  extras reset dropped; eq_fixed_data defined here (upstream: linker).
+  A Stereo/Right lane takes its master's settings through ta_eq_right
+  (ours: the right side's EQ gain offsets).
+- filter_curve.c: includes eq_design.h instead of ext.h.
+- mix_fx.h: without remote edits, MIDI clock and page; mix_of() and
+  mix_now() read a preset's MixFX bytes (fw/src/preset.h); our block
+  entries declared at the end.
+- mix_fx.c: the per-frame hooks (patch_channel_fx_hook, patch_mix_fx_hook)
+  replaced by block entries: ta_mix_block (an edit's routes, all pending
+  compressor coefficients at once, CV every 32 frames, delay tempo every
+  256), ta_mix_channels (x[frame][8], keys kept per frame for the mix
+  compressor), ta_mix_bus (the sends from one Pre/Post source per channel
+  that fx.c picks; effects 0 runs the mix compressor alone; returns the
+  block's return peak). Channels arrive at 2^30 (6 dB headroom): their
+  detector and sidechain keys are doubled to stock's level and drive reads
+  them at that scale (CHANNEL_SHIFT). Send levels' CV routes worked out
+  once a block (the CV holds still through one). The delay's glide takes
+  its last fraction (upstream's shift stopped up to 8 frames short of a
+  longer time). s64 accumulators in the reverb's tap sums and
+  multiplications for left shifts of negative values (UB traps in DEBUG).
+  The CV counts are ta_cv_counts; pairs come from ta_pair_right; no Time
+  MIDI clock yet (a MIDI tempo plays 120 BPM, as upstream with no clock);
+  the delay no longer follows a channel's Time Lock tempo (MIDI clock and our CV CLOCK: ta_midi_beat_q8,
+  ta_clock_beat_q8, fw/src/tlock.c).
+  mix_fx_wants_midi_clock dropped.
+  ta_mix_bus adds the Sample input monitor's sends (ta_mix_monitor, ours)
+  to the channels' before the reverb and delay read them.
+  ta_mix_bus switches the stage timer (prof_to, fw/src/prof.h) around
+  the reverb, delay and mix compressor. mix_fx_flush (ours) zeroes the
+  reverb, chorus and delay memory and the compressors for a clean preset
+  load.
+  For CPU (NEON, staged over the block; the same results unless noted):
+  the channel compressors and drives in float, four channels a vector
+  (drive worked out along the curve's 256-step chords; log2/exp2 by fits
+  within 5e-5 octave; one-pole glides in float): not bit-identical,
+  emu/mixresp.py holds them to the model as before. Sends with the
+  levels' weights held while they rest; the resamplers as histories with
+  NEON FIRs; the hall without wander with its combs and taps in lanes
+  (tap offsets worked out at layout); the delay's soft clip without a
+  64-bit division; the mix compressor over the block; a changed algorithm
+  clears 256 words a tick (4 ms of silence, was 1 ms).
+  ta_reverb80 (fw/src/fx.c) can take the reverb's place for a block (the
+  70's or 80's reverb, fw/src/r70.c, r80.c); the DEP-5's memory clears when
+  it is back.
+- grains.c, grains.h: upstream's grain engine (ext/grains.c up to render(),
+  the fields and routes of src/patch.h, grain_ranges of
+  src/preset_extras.c) as a library: one struct grain_state per channel
+  and a struct grain_tuning per channel published by fx.c (upstream: one
+  playing channel, statics, the IRQ masked); fields() takes the channel's
+  struct grain_value (fw/src/preset.h, upstream's struct grain_settings).
+  The voice's playhead and steps come from fw/src/engine.c a block at a
+  time (upstream: stock's playhead word and recorded steps per frame);
+  a zone has a direction (dir -1 reads a reversed voice's frames backward
+  where upstream reads stock's reversed buffer forward: the same values);
+  no ranges table (the zone comes with each block). Each channel seeds
+  its own random sequence (channel 1: upstream's). The steps in Q32 are
+  multiplications (left shifts of negative values trap in DEBUG). For CPU
+  the render runs a grain at a time, four frames to a NEON vector,
+  between the frames that start a grain (when a grain ends is worked out
+  from its phase and fade at the start of a span). tools/graintest.sh
+  builds upstream's engine untouched beside it: every output frame is
+  the same over random settings, CV, zones, loops, FM, rests, pairs and
+  reversed zones.
+- timelock.c, timelock.h (Time Lock's engine, ext/timelock.c up to its
+  foreground, and timelock_guess/timelock_init): a library, one struct
+  lock per channel; fw/src/tlock.c (ours) holds the tables, clocks, slice
+  maps, tempo and foreground (upstream's timelock_foreground, zone_build,
+  timelock_tempo, timelock_beat_q8, ext/slice_maps.c). channel_frame is
+  timelock_frame(): the voice's playhead and output passed in, a playhead
+  write passed out (join/hold return it; mix_frame returns the gain and
+  the right side's stream sum, which a Stereo/Right channel applies to its
+  own voice: timelock_right). The interrupt's limits across channels (an
+  event a frame, the cycle budget, a run's preloads: warm(), COLD) are
+  left out; streams_live is counted at a block's start. Clocks are run by
+  the caller (timelock_clock_frame/_edge/_now) and a frame reads its
+  clock's state (struct clock_now). For the block renderer:
+  timelock_quiet (the frames until one may move the voice, from the same
+  state), timelock_follows, timelock_run (timelock_frame over a run, its
+  quiet frames without fades or events in one tight loop: the same
+  state). Bit-exact local changes: shifts of signed values as unsigned
+  (no UB), sine_at's interpolation in 32 bits, equal-power fades skip the
+  law blend at law 0. The random seed is named (timelock_seed) so a test
+  can replay. timelock_guess takes the name, not the stock record.
+- joins.c: joins_plan takes the lock, zone, pair and step. Change of
+  behaviour: the reads are scaled to +-1 (SAMPLE_SCALE): upstream sums Q31
+  values as floats, so a loud loop's energy products overflow to inf and
+  the correlation is NaN (the search then picks the natural start and
+  the law is undefined, 0 on ARM); its thresholds (1e-6 per point, 1e-30)
+  assume +-1. law_of maps NaN to 0.
+- hits.c: unmodified but for the include.
+- tools/tltest.sh: upstream's engine and joins.c (with the SAMPLE_SCALE
+  change by sed) beside ours on one channel: 200 random cases x 200000
+  frames, mono and pairs, Own/Speed/CV/MIDI clocks, loops, pitch, FM,
+  rests, retriggers; every frame and every playhead write equal, frame by
+  frame and again through timelock_run in runs of 1-32 frames; then tempo
+  checks (hits land on the tempo's grid within 1-2 frames, lap after lap).
+eq_math.c, eq_design.h and mix_tables.h are unmodified.

@@ -1,0 +1,10 @@
+FatFs R0.16 with ff16p1.diff and ff16p2.diff (http://elm-chan.org/fsw/ff/,
+patches page of July 10, 2026), CRLF converted to LF. Files: ff.c ff.h
+ffunicode.c diskio.h ffconf.h LICENSE.txt. ffconf.h changes: FF_CODE_PAGE
+437, FF_USE_LFN 1, FF_FS_NORTC 1, FF_NORTC_YEAR 2026. diskio.c is ours
+(../src/diskio.c).
+Local change in ff.c f_read: a direct multi-sector read continues over
+contiguous clusters (one disk_read instead of one per cluster), marked
+"a8m".
+Local addition f_open_at (ff.c, ff.h): opens a file for reading by its
+directory position, skipping the linear name search; marked "a8m".

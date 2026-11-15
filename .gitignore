@@ -1,0 +1,6 @@
+ref/
+tmp/
+.DS_Store
+stock/
+__pycache__/
+.claude/worktrees/

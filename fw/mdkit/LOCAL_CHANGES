@@ -1,0 +1,107 @@
+Local changes to the vendored mdkit (fw/mdkit), all output-preserving
+(checked with emu/voicecost.py: each voice's raw output on the firmware is
+compared with the untouched upstream mdkit in ref/mdkit, built natively).
+
+- Sine tables (include/mdkit_tables.h, ../src/sine_tables.c): every voice's
+  index -> 24-bit sine function evaluated a double-precision series per
+  sample. They are pure functions of a 15-bit index and come in three
+  formulas; the voices sharing each were checked to give identical values
+  for all 32768 indices. The functions now read mdkit_sine_{efm,xt,trx},
+  filled once at boot by mdkit_tables_init().
+- TRX "model memory" (cb ch cl cp cy ma oh rs sd): each voice's
+  <prefix>_trx_model_memory(i) is a pure function, identical across the
+  nine (hashed over i < 8448). Renamed to ..._calc, which fills the shared
+  mdkit_model_memory[] on the first such voice's init; the accessor reads
+  the table (falls back to _calc beyond it).
+- TRX-SD sd_attack(index): a 33-tap convolution per sample, pure in the
+  index; tabulated for index < 4096 (the render reads up to 0xfe0 + 31),
+  filled on init.
+- TRX-RS attack (trx_rs_trx_rs_attack): a 127-harmonic sum per sample for
+  the first 768 samples of a hit (bursts of ~800 us per block on hardware),
+  pure in the index; tabulated (768 entries), filled on init. Index >= 768
+  returned 0 already.
+- TRX-BD boards (trx_bd_trx_bd_board_a/b): a 7-term double Chebyshev
+  series and a double -> int64 conversion per sample for the first nine
+  internal blocks of a hit, pure in the index; tabulated (288 entries
+  each), filled on init. Index >= 288 returned 0 already.
+- PI voices' modal_wrap: the per-call `while (mask <= m) mask <<= 1;`
+  power-of-two mask is computed with __builtin_clz (same value, m < 2^31).
+- DSP helpers (all voices): signed_bits as a shift pair, s24 as a 32-bit
+  sign extension, products widened from 32 bits (one smull).
+- PI voices' ROM (<p>_rom): computed per access (decay series, sample
+  synthesis from coefficients), pure in the address. Renamed _rom_calc;
+  the 0x142000-0x144fff window the render reads is tabulated (48 KB per
+  voice), filled on init; other addresses still call _rom_calc. PI-RC/CC/
+  HH (identical ROM functions) instead share one table of 0x140000-
+  0x14ffff (mdkit_metal_rom, 256 KB): their metal_read also reads the
+  0x145224.. filter curves and 0x148000.. sine, a double series per
+  sample (~60 us per voice per block on trigger blocks).
+- acc_to_word (all voices with the standard 56->24-bit saturation): done
+  on the high word: in range iff bits 47..55 agree, else saturate by bit
+  55. Equal for every input (the original's limits +-(0x7fffff/0x800000
+  << 24) give the same middle word at the range edges). Now as one ssat
+  of bits 24..55 (the same test).
+- asr (all voices with the 56-bit arithmetic shift): the signed division
+  with a ceiling for negatives is floor(v / 2^n), i.e. v >> n.
+- PI voices' coefficient ring: modal_wrap(p, 1, 2) as <p>_modal_wrap_1_2
+  ((p & 3) >= 2 ? p - 2 : p + 1, equal for p < 2^24).
+- EFM-BD: (double)(long long)v through a 32-bit conversion when in range;
+  its sines take x in [0, 2pi), so the wrap is "subtract 2pi above pi",
+  with the original division kept within 1e-4 of pi.
+- PI voices' 56-bit helpers (add, sub, asl, mac, mpy, from24): no
+  & MD_MASK56. Every consumer (mid, low, s56, acc_to_word, to48, asr,
+  the masks in the voice code) reads only bits 0..55, which wrap the same
+  mod 2^64. Checked by injecting garbage into bits 56..63 of every
+  helper result: 30 s of each PI voice under random controls and
+  retriggers stays bit-identical to upstream.
+- PI metal_advance: the mask loop as __builtin_clz (as modal_wrap).
+- include/mdkit_pi_modes.h (NEON where noted), all bit-exact:
+  - drum_modes (PI-SD/RS) and <p>_modal_filter (PI-BD/MT/ML): the eight
+    mode recursions are independent (each mode's coefficients are
+    y[0x64 + 4m ..], its input w[0x60..]); only the saturating carry
+    chain couples them. NEON: two modes per vector, then the chain four
+    samples per vector.
+  - PI-RC/CC/HH metal_filter: the five-MAC section is a second-order
+    recursion on its own saturated output; the feed-forward taps are
+    summed first, two c1 MACs merged, plain int64 accumulators.
+  - metal_delay_read/write: direct indexing when both pages lie in the
+    delay bank (else the original path).
+  - The render's s24 -> float output (NEON fixed-point convert, exact).
+- PI NEON, second pass (2026-11-13; same checks plus 30 s x 3 seeds of
+  each PI voice natively under random controls, retriggers and render
+  sizes, bit-identical to upstream, also under UBSan). In NEON a 24-bit
+  word w enters as s24(w) << 8, so a product with 2 s24(k) is the
+  voices' mpy << 8 and an accumulator's high word is acc_to_word's
+  bits 24..55 (vqshl then saturates it to 24 bits):
+  - The one-pole sections (out = word(s); s = mac(s, x, g) - mpy(out, g))
+    of PI-BD/MT (three delay lines + the excitation filter) and PI-SD/RS
+    (two lanes, the noise-gain line, the excitation filter): four at once
+    as two lane pairs (mdkit_pi_poles4). PI-SD/RS's third line runs with
+    the others; nothing it reads changes in between. PI-ML's allpass: one
+    multiply a step (s + 2 s24(g) (s24(x) - s24(out))).
+  - The three-way delay mixes (PI-BD/MT, PI-SD/RS), the feedback sections
+    (only the recursion scalar, its other terms precomputed), the SD/RS
+    rattle/noise mixes, PI-ML's input and output gains, PI-RS's gain.
+  - The excitation ramps and interpolations (BD/MT/ML, SD, RS) when every
+    phase stays in 48 bits and every word read lies in the tabulated ROM
+    window (else the original loops): the ramp and the table reads scalar,
+    the products in NEON. PI-SD's halving of the fractions keeps bit 24 of
+    the final phase (and phase + step) for the first two.
+  - Mode coefficients (BD/MT/ML modal_coefficients, SD/RS
+    drum_coefficients): table and damping reads scalar, the arithmetic in
+    NEON. SD/RS's variant gain asl(g - from24(0x400000), 1) is
+    asl(g, 1) + from24(0x800000).
+  - Mode banks: two lane pairs (four modes) per loop, the accumulators'
+    high words kept (32-bit) for the carry chain, which then adds in 32
+    bits (from24(w) has a clear low word); history saved from NEON lanes.
+  - PI-RC/CC/HH: delay reads (both sections as lanes) and writes, the
+    coupling mix, the filter's feed-forward taps and outputs/fractions
+    (its recursion two smlal a step), the amplitude gains (attack: a
+    ramp, decay: a chain stepping every second sample), the noise gate
+    and the output pairs (f[j] = sat24(2 (f[j] + w[4 + j]))).
+  - Multipliers are loaded into NEON from memory (GCC moved scalar ones
+    in lane by lane at every use).
+- Noise salt (include/mdkit.h mdkit_noise_salt, defined in fw/src/voices.c):
+  added to the start value of every noise generator (TRX-SD/MA/CP/B2/CH/OH,
+  PI-SD/RS/ML/MA/HH/CC/RC, EFM-SD) where it is set. 0 (always, except a
+  Stereo/Right voice's calls) is upstream's output.
